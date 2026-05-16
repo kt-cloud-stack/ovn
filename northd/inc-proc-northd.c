@@ -374,6 +374,10 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
      * lookup OVN ports. */
     engine_add_input(&en_advertised_mac_binding_sync, &en_northd,
                      engine_noop_handler);
+    /* Distributed dnat_and_snat NAT entries (e.g. floating IPs) are
+     * advertised via EVPN as well.  Trigger a recompute on any lr_nat
+     * change so that those entries are picked up. */
+    engine_add_input(&en_advertised_mac_binding_sync, &en_lr_nat, NULL);
 
     engine_add_input(&en_learned_route_sync, &en_sb_learned_route,
                      learned_route_sync_sb_learned_route_change_handler);

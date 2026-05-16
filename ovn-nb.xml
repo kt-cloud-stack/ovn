@@ -1023,7 +1023,11 @@
         <p>
           If <code>ip</code> is specified then ovn-controller will advertise
           all IPs/MACs bindings that are local to the chassis. This applies to
-          VIFs and router ports.
+          VIFs and router ports.  In addition, the external IP/MAC of any
+          distributed <code>dnat_and_snat</code> NAT entry (for example a
+          floating IP) whose distributed gateway port is attached to this
+          logical switch is advertised, using the NAT's
+          <ref column="external_mac" table="NAT"/>.
         </p>
       </column>
     </group>

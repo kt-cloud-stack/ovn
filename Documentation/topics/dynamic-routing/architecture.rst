@@ -613,6 +613,17 @@ external network fabric.  Each record includes:
 - ``ip`` --- The IP address to announce.
 - ``mac`` --- The MAC address to announce.
 
+For each EVPN-enabled logical switch, ``ovn-northd`` populates the
+table from the following sources:
+
+- The MAC/IP addresses of regular VIF ports on the logical switch.
+- The MAC/IP addresses of router ports peered with the logical switch.
+- The ``external_ip``/``external_mac`` of any distributed
+  ``dnat_and_snat`` NAT entry on a router whose distributed gateway
+  port is attached to the logical switch.  This allows floating IPs
+  to be advertised as EVPN Type-2 routes alongside directly attached
+  workloads.
+
 ``ovn-controller`` reads these records and installs the corresponding
 static FDB and neighbor entries on the appropriate kernel interfaces,
 making them available to the routing daemon for EVPN advertisement.
