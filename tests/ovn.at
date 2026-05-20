@@ -46214,3 +46214,58 @@ AT_CHECK([grep -q "WARN.*dynamic-routing" hv/ovn-controller.log], [1])
 OVN_CLEANUP([hv])
 AT_CLEANUP
 ])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([LS EVPN Advertised_MAC_Binding sync with NAT])
+ovn_start
+
+AS_BOX([Create logical switch])
+check ovn-nbctl ls-add ls-evpn                                              -- set logical_switch ls-evpn other_config:dynamic-routing-vni=10       -- lsp-add ls-evpn vm1                                                  -- lsp-set-addresses vm1 "00:00:00:00:01:00 10.0.0.2"                   -- lsp-add ls-evpn ln-evpn                                              -- lsp-set-type ln-evpn localnet                                        -- lsp-set-addresses ln-evpn unknown                                    -- lsp-set-options ln-evpn network_name=physnet1
+check ovn-nbctl --wait=sb sync
+check_row_count Advertised_MAC_Binding 0
+ls_evpn_uuid=$(fetch_column Datapath_Binding _uuid external_ids:name=ls-evpn)
+
+AS_BOX([Create router and attach to LS])
+check ovn-nbctl lr-add lr                                           -- lrp-add lr lrp 00:00:00:00:01:01 10.0.0.1/24                 -- lrp-set-gateway-chassis lrp hv1                              -- lsp-add ls-evpn ls-evpn-lrp                                  -- lsp-set-type ls-evpn-lrp router                              -- lsp-set-addresses ls-evpn-lrp 00:00:00:00:01:01              -- lsp-set-options ls-evpn-lrp router-port=lrp
+check ovn-nbctl --wait=sb sync
+
+AS_BOX([Enable NAT redistribution])
+check ovn-nbctl --wait=sb set logical_switch ls-evpn other_config:dynamic-routing-redistribute=nat
+# No Advertised_MAC_Binding yet because no NAT is configured
+check_row_count Advertised_MAC_Binding 0
+
+AS_BOX([Add a floating IP (centralized)])
+check ovn-nbctl lr-nat-add lr dnat_and_snat 10.0.0.100 192.168.0.2
+check ovn-nbctl --wait=sb sync
+# Should advertise FIP with LRP MAC
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.100 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:01'
+
+AS_BOX([Add a floating IP (distributed)])
+check ovn-nbctl lsp-add ls-evpn vm2     -- lsp-set-addresses vm2 "00:00:00:00:01:02 10.0.0.3"
+check ovn-nbctl lr-nat-add lr dnat_and_snat 10.0.0.101 192.168.0.3 vm2 00:00:00:00:01:02
+check ovn-nbctl --wait=sb sync
+# Should advertise distributed FIP with external_mac
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.101 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:02'
+check_row_count Advertised_MAC_Binding 2
+
+AS_BOX([Enable IP and NAT redistribution])
+check ovn-nbctl --wait=sb set logical_switch ls-evpn other_config:dynamic-routing-redistribute=ip,nat
+# Should advertise vm1 IP, vm2 IP, LRP IP, and both FIPs
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.2 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:00'
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.3 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:02'
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.1 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:01'
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.100 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:01'
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.101 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:02'
+check_row_count Advertised_MAC_Binding 5
+
+AS_BOX([Disable NAT redistribution])
+check ovn-nbctl --wait=sb set logical_switch ls-evpn other_config:dynamic-routing-redistribute=ip
+# Should advertise vm1 IP, vm2 IP, and LRP IP
+check_row_count Advertised_MAC_Binding 3
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.2 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:00'
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.3 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:02'
+check_row_count Advertised_MAC_Binding 1 ip=10.0.0.1 datapath=$ls_evpn_uuid mac='00\:00\:00\:00\:01\:01'
+
+OVN_CLEANUP_NORTHD
+AT_CLEANUP
+])
