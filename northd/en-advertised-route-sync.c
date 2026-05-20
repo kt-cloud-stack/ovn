@@ -895,6 +895,99 @@ advertised_mac_binding_add(struct hmap *map,
 }
 
 static void
+build_advertised_mac_binding_ip(const struct ovn_datapath *od,
+                               const struct ovn_port *op,
+                               struct hmap *map)
+{
+    if (lsp_is_router(op->nbsp) && op->peer) {
+        advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
+                                   &op->peer->lrp_networks);
+    }
+
+    if (!strcmp(op->nbsp->type, "")) { /* LSP */
+        advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
+                                   op->lsp_addrs);
+    }
+}
+
+static void
+build_advertised_mac_binding_nat(const struct ovn_datapath *od,
+                                const struct ovn_port *op,
+                                const struct lr_stateful_table *lr_stateful_table,
+                                const struct hmap *ls_ports,
+                                struct hmap *map)
+{
+    if (!lsp_is_router(op->nbsp) || !op->peer) {
+        return;
+    }
+
+    const struct lr_stateful_record *lr_stateful_rec =
+        lr_stateful_table_find_by_uuid(lr_stateful_table,
+                                       op->peer->od->key);
+    if (!lr_stateful_rec) {
+        return;
+    }
+
+    const struct lr_nat_record *lrnat_rec = lr_stateful_rec->lrnat_rec;
+    for (size_t i = 0; i < lrnat_rec->n_nat_entries; i++) {
+        const struct ovn_nat *nat = &lrnat_rec->nat_entries[i];
+        if (nat->type != DNAT_AND_SNAT || !nat->is_valid) {
+            continue;
+        }
+
+        /* If NAT has a gateway_port configured, it must match the
+         * current router port. */
+        if (nat->l3dgw_port) {
+            if (nat->l3dgw_port != op->peer) {
+                continue;
+            }
+        } else if (!op->peer->od->is_gw_router) {
+            continue;
+        }
+
+        const struct sbrec_port_binding *advertising_sb = op->sb;
+        if (nat->is_distributed && nat->nb->logical_port) {
+            struct ovn_port *vif_op =
+                ovn_port_find(ls_ports, nat->nb->logical_port);
+            if (vif_op && vif_op->sb && vif_op->od == od) {
+                advertising_sb = vif_op->sb;
+            }
+        }
+
+        struct eth_addr mac = nat->is_distributed
+                              ? nat->mac
+                              : op->peer->lrp_networks.ea;
+        char mac_s[ETH_ADDR_STRLEN + 1];
+        snprintf(mac_s, sizeof mac_s, ETH_ADDR_FMT, ETH_ADDR_ARGS(mac));
+
+        for (size_t j = 0; j < nat->ext_addrs.n_ipv4_addrs; j++) {
+            if (!advertised_mac_binding_entry_find(map, od->sdp->sb_dp,
+                    advertising_sb, nat->ext_addrs.ipv4_addrs[j].addr_s,
+                    mac_s)) {
+                advertised_mac_binding_entry_add(map, od->sdp->sb_dp,
+                    advertising_sb, nat->ext_addrs.ipv4_addrs[j].addr_s,
+                    mac_s);
+            }
+        }
+
+        for (size_t j = 0; j < nat->ext_addrs.n_ipv6_addrs; j++) {
+            if (prefix_is_link_local(&nat->ext_addrs.ipv6_addrs[j].addr,
+                                     128)) {
+                continue;
+            }
+
+            if (!advertised_mac_binding_entry_find(map, od->sdp->sb_dp,
+                    advertising_sb, nat->ext_addrs.ipv6_addrs[j].addr_s,
+                    mac_s)) {
+                advertised_mac_binding_entry_add(map, od->sdp->sb_dp,
+                    advertising_sb, nat->ext_addrs.ipv6_addrs[j].addr_s,
+                    mac_s);
+            }
+        }
+    }
+}
+
+static void
 build_advertised_mac_binding(const struct ovn_datapath *od,
                              const struct lr_stateful_table *lr_stateful_table,
                              const struct hmap *ls_ports,
@@ -916,82 +1009,12 @@ build_advertised_mac_binding(const struct ovn_datapath *od,
         }
 
         if (nrm_mode_IP_is_set(mode)) {
-            if (lsp_is_router(op->nbsp) && op->peer) {
-                advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
-                                           &op->peer->lrp_networks);
-            }
-
-            if (!strcmp(op->nbsp->type, "")) { /* LSP */
-                advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
-                                           op->lsp_addrs);
-            }
+            build_advertised_mac_binding_ip(od, op, map);
         }
 
-        if (nrm_mode_NAT_is_set(mode) && lsp_is_router(op->nbsp) && op->peer) {
-            const struct lr_stateful_record *lr_stateful_rec =
-                lr_stateful_table_find_by_uuid(lr_stateful_table,
-                                               op->peer->od->key);
-            if (!lr_stateful_rec) {
-                continue;
-            }
-
-            const struct lr_nat_record *lrnat_rec = lr_stateful_rec->lrnat_rec;
-            for (size_t i = 0; i < lrnat_rec->n_nat_entries; i++) {
-                const struct ovn_nat *nat = &lrnat_rec->nat_entries[i];
-                if (nat->type != DNAT_AND_SNAT || !nat->is_valid) {
-                    continue;
-                }
-
-                /* If NAT has a gateway_port configured, it must match the
-                 * current router port. */
-                if (nat->l3dgw_port) {
-                    if (nat->l3dgw_port != op->peer) {
-                        continue;
-                    }
-                } else if (!op->peer->od->is_gw_router) {
-                    continue;
-                }
-
-                const struct sbrec_port_binding *advertising_sb = op->sb;
-                if (nat->is_distributed && nat->nb->logical_port) {
-                    struct ovn_port *vif_op =
-                        ovn_port_find(ls_ports, nat->nb->logical_port);
-                    if (vif_op && vif_op->sb && vif_op->od == od) {
-                        advertising_sb = vif_op->sb;
-                    }
-                }
-
-                struct eth_addr mac = nat->is_distributed
-                                      ? nat->mac
-                                      : op->peer->lrp_networks.ea;
-                char mac_s[ETH_ADDR_STRLEN + 1];
-                snprintf(mac_s, sizeof mac_s, ETH_ADDR_FMT, ETH_ADDR_ARGS(mac));
-
-                for (size_t j = 0; j < nat->ext_addrs.n_ipv4_addrs; j++) {
-                    if (!advertised_mac_binding_entry_find(map, od->sdp->sb_dp,
-                            advertising_sb, nat->ext_addrs.ipv4_addrs[j].addr_s,
-                            mac_s)) {
-                        advertised_mac_binding_entry_add(map, od->sdp->sb_dp,
-                            advertising_sb, nat->ext_addrs.ipv4_addrs[j].addr_s,
-                            mac_s);
-                    }
-                }
-
-                for (size_t j = 0; j < nat->ext_addrs.n_ipv6_addrs; j++) {
-                    if (prefix_is_link_local(&nat->ext_addrs.ipv6_addrs[j].addr,
-                                             128)) {
-                        continue;
-                    }
-
-                    if (!advertised_mac_binding_entry_find(map, od->sdp->sb_dp,
-                            advertising_sb, nat->ext_addrs.ipv6_addrs[j].addr_s,
-                            mac_s)) {
-                        advertised_mac_binding_entry_add(map, od->sdp->sb_dp,
-                            advertising_sb, nat->ext_addrs.ipv6_addrs[j].addr_s,
-                            mac_s);
-                    }
-                }
-            }
+        if (nrm_mode_NAT_is_set(mode)) {
+            build_advertised_mac_binding_nat(od, op, lr_stateful_table,
+                                             ls_ports, map);
         }
     }
 }
