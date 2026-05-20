@@ -373,7 +373,9 @@ void inc_proc_northd_init(struct ovsdb_idl_loop *nb,
      * We do need to access en_northd (input) data, i.e., to
      * lookup OVN ports. */
     engine_add_input(&en_advertised_mac_binding_sync, &en_northd,
-                     engine_noop_handler);
+                     NULL);
+    engine_add_input(&en_advertised_mac_binding_sync, &en_lr_stateful,
+                     NULL);
 
     engine_add_input(&en_learned_route_sync, &en_sb_learned_route,
                      learned_route_sync_sb_learned_route_change_handler);

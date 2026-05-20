@@ -23,7 +23,10 @@
 #include "en-lr-stateful.h"
 #include "lb.h"
 #include "openvswitch/hmap.h"
+#include "openvswitch/vlog.h"
 #include "ovn-util.h"
+
+VLOG_DEFINE_THIS_MODULE(en_advertised_route_sync);
 
 struct ar_entry {
     struct hmap_node hmap_node;
@@ -800,18 +803,6 @@ struct advertised_mac_binding {
     char *mac;
 };
 
-static bool
-evpn_ip_redistribution_enabled(const struct ovn_datapath *od)
-{
-    if (!od->has_evpn_vni) {
-        return false;
-    }
-
-    enum neigh_redistribute_mode mode =
-        parse_neigh_dynamic_redistribute(&od->nbs->other_config);
-    return nrm_mode_IP_is_set(mode);
-}
-
 static uint32_t
 advertised_mac_binding_get_hash(const struct sbrec_datapath_binding *dp,
                                 const struct sbrec_port_binding *sb,
@@ -904,28 +895,103 @@ advertised_mac_binding_add(struct hmap *map,
 }
 
 static void
-build_advertised_mac_binding(const struct ovn_datapath *od, struct hmap *map)
+build_advertised_mac_binding(const struct ovn_datapath *od,
+                             const struct lr_stateful_table *lr_stateful_table,
+                             const struct hmap *ls_ports,
+                             struct hmap *map)
 {
     ovs_assert(od->nbs);
 
-    if (!evpn_ip_redistribution_enabled(od)) {
+    if (!od->has_evpn_vni) {
         return;
     }
 
+    enum neigh_redistribute_mode mode =
+        parse_neigh_dynamic_redistribute(&od->nbs->other_config);
+
     struct ovn_port *op;
     HMAP_FOR_EACH (op, dp_node, &od->ports) {
-        if (!op->sb) {
+        if (!op->sb || !op->nbsp) {
             continue;
         }
 
-        if (lsp_is_router(op->nbsp) && op->peer) {
-            advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
-                                       &op->peer->lrp_networks);
+        if (nrm_mode_IP_is_set(mode)) {
+            if (lsp_is_router(op->nbsp) && op->peer) {
+                advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
+                                           &op->peer->lrp_networks);
+            }
+
+            if (!strcmp(op->nbsp->type, "")) { /* LSP */
+                advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
+                                           op->lsp_addrs);
+            }
         }
 
-        if (!strcmp(op->nbsp->type, "")) { /* LSP */
-            advertised_mac_binding_add(map, od->sdp->sb_dp, op->sb,
-                                       op->lsp_addrs);
+        if (nrm_mode_NAT_is_set(mode) && lsp_is_router(op->nbsp) && op->peer) {
+            const struct lr_stateful_record *lr_stateful_rec =
+                lr_stateful_table_find_by_uuid(lr_stateful_table,
+                                               op->peer->od->key);
+            if (!lr_stateful_rec) {
+                continue;
+            }
+
+            const struct lr_nat_record *lrnat_rec = lr_stateful_rec->lrnat_rec;
+            for (size_t i = 0; i < lrnat_rec->n_nat_entries; i++) {
+                const struct ovn_nat *nat = &lrnat_rec->nat_entries[i];
+                if (nat->type != DNAT_AND_SNAT || !nat->is_valid) {
+                    continue;
+                }
+
+                /* If NAT has a gateway_port configured, it must match the
+                 * current router port. */
+                if (nat->l3dgw_port) {
+                    if (nat->l3dgw_port != op->peer) {
+                        continue;
+                    }
+                } else if (!op->peer->od->is_gw_router) {
+                    continue;
+                }
+
+                const struct sbrec_port_binding *advertising_sb = op->sb;
+                if (nat->is_distributed && nat->nb->logical_port) {
+                    struct ovn_port *vif_op =
+                        ovn_port_find(ls_ports, nat->nb->logical_port);
+                    if (vif_op && vif_op->sb && vif_op->od == od) {
+                        advertising_sb = vif_op->sb;
+                    }
+                }
+
+                struct eth_addr mac = nat->is_distributed
+                                      ? nat->mac
+                                      : op->peer->lrp_networks.ea;
+                char mac_s[ETH_ADDR_STRLEN + 1];
+                snprintf(mac_s, sizeof mac_s, ETH_ADDR_FMT, ETH_ADDR_ARGS(mac));
+
+                for (size_t j = 0; j < nat->ext_addrs.n_ipv4_addrs; j++) {
+                    if (!advertised_mac_binding_entry_find(map, od->sdp->sb_dp,
+                            advertising_sb, nat->ext_addrs.ipv4_addrs[j].addr_s,
+                            mac_s)) {
+                        advertised_mac_binding_entry_add(map, od->sdp->sb_dp,
+                            advertising_sb, nat->ext_addrs.ipv4_addrs[j].addr_s,
+                            mac_s);
+                    }
+                }
+
+                for (size_t j = 0; j < nat->ext_addrs.n_ipv6_addrs; j++) {
+                    if (prefix_is_link_local(&nat->ext_addrs.ipv6_addrs[j].addr,
+                                             128)) {
+                        continue;
+                    }
+
+                    if (!advertised_mac_binding_entry_find(map, od->sdp->sb_dp,
+                            advertising_sb, nat->ext_addrs.ipv6_addrs[j].addr_s,
+                            mac_s)) {
+                        advertised_mac_binding_entry_add(map, od->sdp->sb_dp,
+                            advertising_sb, nat->ext_addrs.ipv6_addrs[j].addr_s,
+                            mac_s);
+                    }
+                }
+            }
         }
     }
 }
@@ -942,6 +1008,8 @@ en_advertised_mac_binding_sync_run(struct engine_node *node,
                                    void *data OVS_UNUSED)
 {
     struct northd_data *northd_data = engine_get_input_data("northd", node);
+    struct ed_type_lr_stateful *lr_stateful_data =
+        engine_get_input_data("lr_stateful", node);
     const struct sbrec_advertised_mac_binding_table *sbrec_adv_mb_table =
         EN_OVSDB_GET(engine_get_input("SB_advertised_mac_binding", node));
     const struct engine_context *eng_ctx = engine_get_context();
@@ -951,7 +1019,9 @@ en_advertised_mac_binding_sync_run(struct engine_node *node,
 
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, &northd_data->ls_datapaths.datapaths) {
-        build_advertised_mac_binding(od, &advertised_mac_binding_map);
+        build_advertised_mac_binding(od, &lr_stateful_data->table,
+                                     &northd_data->ls_ports,
+                                     &advertised_mac_binding_map);
     }
 
     struct advertised_mac_binding *e;
